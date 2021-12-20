@@ -1,0 +1,122 @@
+#!/bin/bash
+#$1 -> Nombre del binario a ejecutar (incluida extension)
+#$2 -> En caso de limitación de velocidad, ponerla aquí y descomentar lo de debajo.
+##################PARA LA LIMITACIÓN DE VELOCIDAD EN EL ENLACE####################
+#VBoxManage bandwidthctl "A_Activa" add Limit --type network --limit $2
+#VBoxManage modifyvm "A_Activa" --nicbandwidthgroup1 Limit
+#VBoxManage bandwidthctl "B_Activa" add Limit --type network --limit $2
+#VBoxManage modifyvm "B_Activa" --nicbandwidthgroup1 Limit
+###################################################################################
+
+	#Ransomware a analizar
+	ransomware_completo=$1
+
+	############### Parametros de configuracion #########################
+	TIEMPO_CHECK=25 #Tiempo que transcurre para checkear el tamaño de la captura de trafico en MINUTOS
+	TIEMPO_CHECK_2=5 #Tiempo que transcurre para checkear el tamaño de la captura a partir de la 2 vez.
+	TIEMPO_MAX=180 #Tiempo que como maximo va a estar corriendo cada muestra en MINUTOS
+	UMBRAL=10000000 #La captura de trafico tiene que aumentar como minimo 100.000.000 Bytes (100 MB) para no parar el proceso de captura
+	#####################################################################
+
+	
+	ransomware_nombre="${ransomware_completo%%.*}"	#Quitamos todos los puntos
+	ransomware_Noext="${ransomware_completo%.*}"	#Quitamos solo el ultimo punto
+
+	# Guardamos el path
+	cd ../
+	path=$(pwd)
+
+	# Añadimos el archivo funciones
+	source $path/Programa/functions.sh
+
+	#Ponemos la maquina A a capturar
+	captura=$path/CapturasTrafico/$ransomware_nombre'.pcap'
+	VBoxManage modifyvm A_Activa --nictrace1 on --nictracefile1 $captura
+	sleep 5
+
+	# Arrancamos la maquina A y esperamos
+	VBoxManage startvm "A_Activa" --type headless
+	sleep 30
+	# Arrancamos la B
+	VBoxManage startvm "B_Activa" --type headless
+	sleep 30
+
+	# Copiamos el binario en la carpeta compartida entre host y cliente
+	cp $path/binariosRansomware/$ransomware_completo $path/Compartida
+	echo "Copiando el ransomware en el cliente..."
+
+	# Pasamos el ransomware al escritorio de cliente
+	vboxmanage --nologo guestcontrol "A_Activa" run --exe "C:\Windows\System32\cmd.exe" --username usuarioa -- cmd.exe /c ' XCOPY \\VBOXSVR\Compartida\'$ransomware_completo' C:\Users\UsuarioA\Desktop /s/y'
+	sleep 5
+	start=$(date)
+
+	# Ejecutar ransomware en segundo plano
+	echo "Ejecutando el ransomware... "$start
+	vboxmanage guestcontrol "A_Activa" run --exe 'C:\Users\UsuarioA\Desktop\'$ransomware_nombre'.exe' --username UsuarioA &
+
+	PID=$!
+	sleep 30
+	# Matamos el proceso del ransomware, aún así el ransomware sigue activo en la maquina A
+	kill -9 $PID
+	
+	#MAXSIZE=$(du -sb $path/impressions-v1/Directorios | cut -f1) #Obtenemos el tamaño de los directorios
+	#let "MAXSIZE *= 2"	#Lo multiplicamos por dos (lectura y escritura)
+	
+	MAXSIZE=15000000000	#Tamaño maximo de 15 GB
+
+	#Contamos tiempo y tamaño muestra
+	ACTSIZE=$(stat -c %s "$captura")			# Tamaño actual
+	LASTSIZE=0						# Ultimo tamaño
+	TIEMPO=0						# Tiempo transcurrido
+	iteracion=0	
+	while [  $ACTSIZE -lt $MAXSIZE ]; do		#Mientras la captura sea menor que dos veces los directorios
+		if [ $iteracion -le 0 ]
+		then
+			sleep $TIEMPO_CHECK"m" #Esperamos el tiempo check en minutos ("m")
+			let "TIEMPO += TIEMPO_CHECK"
+		else
+			sleep $TIEMPO_CHECK_2"m"
+			let "TIEMPO += TIEMPO_CHECK_2"
+		fi
+		iteracion=$(( $iteracion + 1 ))
+		ACTSIZE=$(stat -c %s $captura)	# Miramos cuanto ocupa la captura	
+		echo Han pasado $TIEMPO minutos
+		if [ $ACTSIZE -lt $(($LASTSIZE + $UMBRAL)) ]  || [ $TIEMPO -ge $TIEMPO_MAX ] #Si la captura no ha aumentado el umbral en el TIEMPO_CHECK, o han pasado ya el maximo de minutos minutos
+		then
+			echo Tamaño: $(bytesToHuman $ACTSIZE)
+			LASTSIZE=$ACTSIZE
+			echo "El proceso de captura ha terminado"
+			break
+		else
+			echo Tamaño: $(bytesToHuman $ACTSIZE)
+			LASTSIZE=$ACTSIZE
+		fi
+	done
+	
+	sleep 20
+	#Apagamos la maquina A
+	VBoxManage controlvm "A_Activa" poweroff
+
+	sleep 5
+	#Paramos de capturar en la maquina A
+	VBoxManage modifyvm  A_Activa --nictrace1 off
+
+	sleep 5
+	#Apagamos la maquina B
+	VBoxManage controlvm "B_Activa" poweroff
+
+	#Lo apuntamos en el registro
+	DIA=`date +"%d/%m/%Y"`
+	HORA=`date +"%H:%M"`
+	echo -e "[$DIA] $HORA: $ransomware_nombre ha sido analizado:\n -Directorios: $archivo_configuracion\n -Tamaño: $(bytesToHuman $LASTSIZE)\n -Tiempo: $TIEMPO minutos\n" >> $path/Registro.txt
+
+
+	#Reiniciamos el escenario para el siguiente directorio/muestra
+	sleep 5
+	#Reiniciamos la maquina A
+	VBoxManage snapshot A_Activa restore ransomware_final
+
+	sleep 5
+	#Reiniciamos la maquina B
+	VBoxManage snapshot B_Activa restore ransomware_final
+
